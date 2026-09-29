@@ -1,4 +1,5 @@
 ﻿using System.Runtime.InteropServices;
+using System.Text.Json;
 using System.Windows;
 using System.Windows.Controls;
 using System.Windows.Input;
@@ -78,7 +79,7 @@ public partial class MainWindow : Window
         BuildNav();
         BuildDock();
         Navigate("launch", instant: true);
-        Loaded += (_, _) => Run(ConnectAsync);
+        Loaded += (_, _) => Run(() => ConnectAsync());
     }
 
     // ==================== 桥接 ====================
@@ -110,9 +111,13 @@ public partial class MainWindow : Window
     /// <summary>连桥这件事有结果了（连上或确定连不上）。冒烟脚本靠它决定什么时候开始逐页走。</summary>
     public Task BridgeSettled => _bridgeSettled.Task;
 
-    private async Task ConnectAsync()
+    private async Task ConnectAsync(bool interactive = true)
     {
         SetBridgeState(L("连接中"), "B.Warn");
+        // 重试进来时先放掉上一份 host：BridgeHost.Dispose 会退掉 BridgeClient（含
+        // HttpClient 与常驻 SSE 任务）并杀掉桥进程。不这样做，每点一次「重试」就漏
+        // 一个 BridgeClient + 一条 SSE 循环 + 一个 HttpClient（socket 不回收）。
+        DetachHost();
         try
         {
             var host = await BridgeHost.StartAsync();
@@ -125,6 +130,16 @@ public partial class MainWindow : Window
                 BridgePill.ToolTip = ok
                     ? $"{host.Backend} · 127.0.0.1:{host.Port}"
                     : L("事件流断开：") + host.Client.LastStreamError;
+                // 事件流刚接回来：断线窗口里丢掉的 finished / task_added 靠 list_tasks 对账
+                if (ok) Run(ReconcileTasksAsync);
+            });
+            // 桥进程本身死了（崩溃 / 被杀 / taskkill）：SSE 循环重连的是同一个死端口，
+            // 前端会永远停在「重连中」。这里把它变成一次可恢复的重连。
+            host.Exited += (_, _) => Dispatcher.BeginInvoke(() =>
+            {
+                SetBridgeState(L("后端已退出"), "B.Danger");
+                BridgePill.ToolTip = L("桥进程已退出，正在重连…");
+                Run(ReconnectAfterDeathAsync);
             });
             _bridgeReady = true;
             SetBridgeState(host.Backend, "B.Accent");
@@ -132,6 +147,8 @@ public partial class MainWindow : Window
             await LoadNavFromBridgeAsync();
             // 壁纸配置也在 config.json 里（ui_background*），跟 Qt / 网页版是同一份
             await Wallpaper.ReloadAsync();
+            // 首次连上也要对一次账：桥可能是外部已经在跑的，本地任务表是空的
+            await ReconcileTasksAsync();
             await ReloadCurrentAsync();
             _bridgeSettled.TrySetResult(null);
             // 第一次开：先把目录 / 下载源问清楚，顺带指一遍容易错过的功能。
@@ -151,11 +168,92 @@ public partial class MainWindow : Window
                 Smoke.Note("bridge", ex.ToString());
                 return;
             }
+            if (!interactive)
+            {
+                // 桥死后自动重连：不弹框（弹框会把无人值守的运行挂住），状态灯已说明情况
+                BridgePill.ToolTip = ex.Message;
+                return;
+            }
             var retry = await Dlg.Confirm(L("连接后端失败"),
                 ex.Message + L("\n\n需要仓库根目录下的 bridge/server.py 或 native/build/pymcl-bridge.exe。"),
                 L("重试"), L("退出"));
             if (retry) await ConnectAsync();
             else Close();
+        }
+    }
+
+    /// <summary>换 host 之前先脱钩 + 释放：事件订阅挂在旧 client 上，不放会一起漏。</summary>
+    private void DetachHost()
+    {
+        var old = AppServices.Host;
+        if (old is null) return;
+        try { old.Client.EventReceived -= OnBridgeEvent; } catch { }
+        try { old.Dispose(); } catch { }
+        AppServices.Host = null;
+        _bridgeReady = false;
+    }
+
+    private bool _reconnecting;
+
+    /// <summary>桥进程死了之后重建一条。失败就退回「未连接」，不再自动重试（避免死循环）。</summary>
+    private async Task ReconnectAfterDeathAsync()
+    {
+        if (_reconnecting || _drained) return;
+        _reconnecting = true;
+        try
+        {
+            await Task.Delay(400);          // 让端口先彻底释放，免得刚连上又断
+            await ConnectAsync(interactive: false);
+        }
+        catch (Exception ex)
+        {
+            SetBridgeState(L("未连接"), "B.Danger");
+            BridgePill.ToolTip = ex.Message;
+        }
+        finally
+        {
+            _reconnecting = false;
+        }
+    }
+
+    /// <summary>
+    /// 用 list_tasks 把任务表对回后端真实状态（后端专门为断线对账留的接口）。
+    /// 两个桥返回同一种形状：{running:[{task_id,title}], finished:[{task_id,success,message}]}。
+    /// </summary>
+    private async Task ReconcileTasksAsync()
+    {
+        if (!_bridgeReady) return;
+        var el = await AppServices.Client.TryCallAsync<JsonElement>("list_tasks");
+        if (el.ValueKind != JsonValueKind.Object) return;
+
+        var running = new List<(string Id, string Title)>();
+        if (el.TryGetProperty("running", out var run) && run.ValueKind == JsonValueKind.Array)
+        {
+            foreach (var it in run.EnumerateArray())
+            {
+                var id = it.TryGetProperty("task_id", out var i) ? i.GetString() ?? "" : "";
+                var title = it.TryGetProperty("title", out var t) ? t.GetString() ?? "" : "";
+                if (id.Length > 0) running.Add((id, title));
+            }
+        }
+
+        var finished = new List<(string Id, bool Success, string Message)>();
+        if (el.TryGetProperty("finished", out var fin) && fin.ValueKind == JsonValueKind.Array)
+        {
+            foreach (var it in fin.EnumerateArray())
+            {
+                var id = it.TryGetProperty("task_id", out var i) ? i.GetString() ?? "" : "";
+                if (id.Length == 0) continue;
+                var ok = it.TryGetProperty("success", out var s) && s.ValueKind == JsonValueKind.True;
+                var msg = it.TryGetProperty("message", out var m) ? m.GetString() ?? "" : "";
+                finished.Add((id, ok, msg));
+            }
+        }
+
+        if (TaskStore.Reconcile(running, finished))
+        {
+            SyncTasks();
+            SyncDock();
         }
     }
 

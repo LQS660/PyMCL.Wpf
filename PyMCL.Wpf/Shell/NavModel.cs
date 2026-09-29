@@ -166,8 +166,8 @@ public static class NavModel
     /// <summary>子页标题。instance 这个键只剩历史含义，打开的是版本管理。</summary>
     public static readonly IReadOnlyDictionary<string, string> SubTitles = new Dictionary<string, string>
     {
-        ["version"] = L("原版游戏"), ["mod"] = "Mod", ["modpack"] = L("整合包"), ["datapack"] = L("数据包"),
-        ["resource"] = L("资源包"), ["shader"] = L("光影包"), ["world"] = L("世界"), ["java"] = "Java",
+        ["version"] = L("原版游戏"), ["mod"] = L("Mod"), ["modpack"] = L("整合包"), ["datapack"] = L("数据包"),
+        ["resource"] = L("资源包"), ["shader"] = L("光影包"), ["world"] = L("世界"), ["java"] = L("Java"),
         ["instance"] = L("版本管理"), ["mods"] = L("模组"), ["account"] = L("账号"), ["multiplayer"] = L("联机"),
         ["servers"] = L("服务器"), ["playtime"] = L("时长"), ["feedback"] = L("反馈"), ["settings"] = L("设置"),
     };

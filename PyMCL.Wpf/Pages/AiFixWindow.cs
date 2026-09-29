@@ -34,6 +34,13 @@ internal sealed class AiFixWindow : Window
     private bool _busy;
     private bool _kicked;
     private readonly string _chatId;
+    /// <summary>
+    /// 订阅时抓到的那一份 client。AppServices.Client 是会被整体替换的（桥重连 / 重试
+    /// 会换一个新实例），退订时必须退到**同一个**实例上；照 OnClosed 里重新读一次
+    /// AppServices.Client 的写法，替换过之后退订就落空了，处理器永远挂在旧 client 上，
+    /// 旧 client 也就永远被这个窗口拽着不放。
+    /// </summary>
+    private readonly BridgeClient? _client;
 
     public AiFixWindow(CrashReport report)
     {
@@ -94,7 +101,8 @@ internal sealed class AiFixWindow : Window
         SyncMainButton();
 
         Loaded += (_, _) => PageBase.Run(KickOffAsync);
-        AppServices.Client.EventReceived += OnBridgeEvent;
+        _client = AppServices.Client;
+        _client.EventReceived += OnBridgeEvent;
     }
 
     /// <summary>开窗即跑：用户气泡只放这句短问话，崩溃报告走隐藏 context 注入。</summary>
@@ -604,11 +612,12 @@ internal sealed class AiFixWindow : Window
 
     protected override void OnClosed(EventArgs e)
     {
-        AppServices.Client.EventReceived -= OnBridgeEvent;
+        // 退订到订阅时那一份 client（见 _client 的说明），不是此刻的 AppServices.Client
+        if (_client is not null) _client.EventReceived -= OnBridgeEvent;
         if (_busy)
         {
             // 窗关了回合别留在后台空转：代答停止（发完就算，不等回执）
-            _ = AppServices.Client.TryCallAsync<JsonElement>("ai_stop");
+            _ = (_client ?? AppServices.Client).TryCallAsync<JsonElement>("ai_stop");
         }
         base.OnClosed(e);
     }

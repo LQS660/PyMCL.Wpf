@@ -20,6 +20,8 @@ public sealed class PlaytimePage : PageBase
 
     /// <summary>秒数 → 后端文案。format_playtime 一个值问一次，同一个值不重复问。</summary>
     private static readonly ConcurrentDictionary<long, string> _durCache = new();
+    /// <summary>缓存上限：键是秒数，不设上限会随游玩时长一直长（Thumbs 那边是 400 条）。</summary>
+    private const int DurCacheMax = 400;
 
     public override string Title => L("游戏时长");
 
@@ -60,8 +62,7 @@ public sealed class PlaytimePage : PageBase
     private async Task ReloadAllAsync()
     {
         var total = await Api.TryCallAsync<long>("get_total_playtime", null, 0L);
-        Motion.CountUp(_total, 0, total / 3600.0, "0.0");
-        _total.Text = await FormatAsync(total);
+        await ShowTotalAsync(total);
         var all = await Api.TryCallAsync<Dictionary<string, JsonElement>>("get_all_playtime", null, new()) ?? new();
         _sub.Text = L("{0} 个实例有记录", all.Count);
         _list.Children.Clear();
@@ -115,8 +116,7 @@ public sealed class PlaytimePage : PageBase
     {
         var data = await Api.TryCallAsync<JsonElement>("get_playtime", new { instance });
         var total = Secs(data);
-        Motion.CountUp(_total, 0, total / 3600.0, "0.0");
-        _total.Text = await FormatAsync(total);
+        await ShowTotalAsync(total);
 
         var versions = Versions(data).OrderByDescending(v => v.Value).ToList();
         var sessions = Sessions(data);
@@ -170,12 +170,25 @@ public sealed class PlaytimePage : PageBase
     // ==================== 时长文案 ====================
     private static string Cached(long secs) => _durCache.GetValueOrDefault(secs) ?? Fmt.Duration(secs);
 
+    /// <summary>
+    /// 累计时长那个大数字。滚动只当动画，结束后必须写回 <c>format_playtime</c> 的权威文案
+    /// （「3 小时 12 分钟」），否则显示的就只是 total/3600 保留一位小数——与 _sub、各行
+    /// 的文案口径都不一致。滚动期间先写一个粗粒度的小时数占位。
+    /// </summary>
+    private async Task ShowTotalAsync(long seconds)
+    {
+        var text = await FormatAsync(seconds);
+        Motion.CountUp(_total, 0, seconds / 3600.0, "0.0", done: () => _total.Text = text);
+    }
+
     /// <summary>后端文案（「3 小时 12 分钟」）是对齐基准；拿不到就退回本地格式化。</summary>
     private static async Task<string> FormatAsync(long seconds)
     {
         if (_durCache.TryGetValue(seconds, out var hit)) return hit;
         var text = await Api.TryCallAsync<string>("format_playtime", new { seconds }, "") ?? "";
         if (string.IsNullOrWhiteSpace(text)) text = Fmt.Duration(seconds);
+        // 键是秒数，随游玩时长一直增长，没有上限就是一个只进不出的字典（Thumbs 那边有 400 条上限）。
+        if (_durCache.Count >= DurCacheMax) _durCache.Clear();
         _durCache[seconds] = text;
         return text;
     }

@@ -74,16 +74,30 @@ public partial class App : Application
         catch { }
     }
 
+    /// <summary>
+    /// 崩溃日志。装在 Program Files 下非管理员运行、或从只读介质启动时，
+    /// AppContext.BaseDirectory 写不进去；此前整体 try/catch{} 一吞，崩溃信息就完全
+    /// 没了（用户只看到一个 Toast，开发者拿不到线索）。这里依次退回 LOCALAPPDATA、TEMP。
+    /// </summary>
     private static void LogCrash(Exception? ex)
     {
         if (ex is null) return;
-        try
+        var text = $"[{DateTime.Now:yyyy-MM-dd HH:mm:ss}] {ex}\n\n";
+        foreach (var dir in new[]
+                 {
+                     AppContext.BaseDirectory,
+                     Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData),
+                     System.IO.Path.GetTempPath(),
+                 })
         {
-            var dir = AppContext.BaseDirectory;
-            System.IO.File.AppendAllText(System.IO.Path.Combine(dir, "pymcl-wpf-error.log"),
-                $"[{DateTime.Now:yyyy-MM-dd HH:mm:ss}] {ex}\n\n");
+            if (string.IsNullOrEmpty(dir)) continue;
+            try
+            {
+                System.IO.File.AppendAllText(System.IO.Path.Combine(dir, "pymcl-wpf-error.log"), text);
+                return;
+            }
+            catch { }
         }
-        catch { }
     }
 
     /// <summary>整字典热替换调色板，避免逐个改画刷造成的闪烁。</summary>
@@ -97,5 +111,10 @@ public partial class App : Application
         else dicts.Add(next);
         // 壁纸的遮罩色与让位用的半透明底都跟着主题走，整字典一换就得重刷一遍
         Wallpaper.OnThemeChanged();
+        // 整字典替换会把 SettingsPage.ApplyVisuals 写进 dicts[0] 的 9 个键
+        // （B.Accent / B.AccentDeep / B.AccentLite / B.AccentSoft / B.AccentSoft2 / B.Ok /
+        //  B.BannerFill / B.Canvas / B.PageWash）一起冲掉——用户自定义的主题色与背景
+        // 于是被静默丢弃，切一次深浅色就退回默认。换完字典立刻按当前设置重刷一遍。
+        Pages.SettingsPage.ApplyVisuals();
     }
 }

@@ -104,4 +104,58 @@ public static class TaskStore
         _rows.RemoveAll(r => r.Finished);
         Cleared?.Invoke();
     }
+
+    /// <summary>
+    /// 断线对账（bridge/api.py:2687 的 list_tasks，C 桥 backend.c 同形）。
+    /// SSE 断开的那段窗口里 task_added / finished 是彻底丢掉的，没有别的地方能补：
+    /// 不跑这一趟，断线期间完成的下载会永远停在「进行中」，新起的任务根本不出现。
+    /// 返回是否有任何一行被改动，调用方据此决定要不要刷 UI。
+    /// </summary>
+    public static bool Reconcile(IReadOnlyList<(string Id, string Title)> running,
+                                 IReadOnlyList<(string Id, bool Success, string Message)> finished)
+    {
+        var changed = false;
+
+        // 1) 桥说在跑的，本地没有就补一行（断线期间新起的任务）
+        foreach (var (id, title) in running)
+        {
+            if (string.IsNullOrEmpty(id) || Get(id) != null) continue;
+            var row = new TaskRow { Id = id, Title = string.IsNullOrEmpty(title) ? PlaceholderTitle : title };
+            _rows.Add(row);
+            Added?.Invoke(row);
+            changed = true;
+        }
+
+        // 2) 桥已经给了结果的：本地还当「进行中」的按结果收口；本地整个没见过的补一行
+        foreach (var (id, success, message) in finished)
+        {
+            if (string.IsNullOrEmpty(id)) continue;
+            var row = Get(id);
+            if (row is null)
+            {
+                row = new TaskRow { Id = id, Title = PlaceholderTitle };
+                _rows.Add(row);
+                Added?.Invoke(row);
+            }
+            else if (row.Finished && row.Success == success)
+            {
+                continue;   // 已经对上了，别重复通知
+            }
+            row.Finished = true;
+            row.Success = success;
+            row.Indeterminate = false;
+            row.Progress = success ? 100 : row.Progress;
+            row.Status = string.IsNullOrEmpty(message) ? (success ? L("已完成") : L("失败")) : message;
+            row.Speed = "";
+            Updated?.Invoke(row);
+            changed = true;
+        }
+
+        // 3) 桥那边既不在跑、也没有结果的「进行中」行：list_tasks 的 finished 只保留
+        //    最近几十条，翻页翻掉的老任务是正常现象。标成失败会误报，所以原样留着，
+        //    交给用户手动清（ClearFinished）。
+        if (_rows.Count > 60) _rows.RemoveRange(0, _rows.Count - 60);
+        if (changed) Cleared?.Invoke();
+        return changed;
+    }
 }

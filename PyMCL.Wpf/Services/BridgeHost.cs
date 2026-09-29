@@ -1,6 +1,7 @@
 using System.Diagnostics;
 using System.IO;
 using System.Security.Cryptography;
+using System.Text;
 using System.Text.RegularExpressions;
 using Microsoft.Win32;
 
@@ -17,6 +18,14 @@ public sealed class BridgeHost : IDisposable
     public string Root { get; }
     public string Backend { get; }
 
+    /// <summary>
+    /// 桥进程退出时触发（正常退出与被杀都算）。此前 <c>EnableRaisingEvents</c> 开了却
+    /// 没人订阅 <c>Exited</c>：桥一死，<see cref="BridgeClient"/> 的 SSE 循环只是在重连
+    /// 一个没人监听的端口，前端永远停在「重连中」，用户只能重启启动器。
+    /// 回调在 Process 的事件线程上跑，订阅方自己切 UI 线程。
+    /// </summary>
+    public event EventHandler? Exited;
+
     private BridgeHost(BridgeClient client, Process proc, int port, string root, string backend)
     {
         Client = client;
@@ -24,6 +33,9 @@ public sealed class BridgeHost : IDisposable
         Port = port;
         Root = root;
         Backend = backend;
+        // EnableRaisingEvents 已在 StartAsync 里打开；这里接上唯一缺的那一环。
+        try { proc.Exited += (s, e) => Exited?.Invoke(this, EventArgs.Empty); }
+        catch (InvalidOperationException) { /* 已经退出了，StartAsync 的健康检查会兜住 */ }
     }
 
     public static async Task<BridgeHost> StartAsync(CancellationToken ct = default)
@@ -129,7 +141,8 @@ public sealed class BridgeHost : IDisposable
     public static string FindRoot()
     {
         var env = Environment.GetEnvironmentVariable("PYMCL_HOME");
-        if (!string.IsNullOrWhiteSpace(env)) return Path.GetFullPath(env);
+        // PYMCL_HOME 手写成 C:\path\ 也一样要归一化：尾反斜杠会让 --root 的实参被解析歪
+        if (!string.IsNullOrWhiteSpace(env)) return NormalizeRoot(Path.GetFullPath(env));
         foreach (var start in new[] { AppContext.BaseDirectory, Environment.CurrentDirectory, Path.GetDirectoryName(typeof(BridgeHost).Assembly.Location) ?? "" })
         {
             var hit = WalkUp(start);
@@ -248,12 +261,28 @@ public sealed class BridgeHost : IDisposable
             var dir = new DirectoryInfo(Path.GetFullPath(start));
             while (dir != null)
             {
-                if (LooksLikeRoot(dir.FullName)) return dir.FullName;
+                if (LooksLikeRoot(dir.FullName)) return NormalizeRoot(dir.FullName);
                 dir = dir.Parent;
             }
         }
         catch { }
         return null;
+    }
+
+    /// <summary>
+    /// 去掉根路径结尾的目录分隔符。<see cref="DirectoryInfo.FullName"/> 在驱动器根目录时
+    /// 以 <c>\</c> 结尾（<c>C:\</c>），而 <c>AppContext.BaseDirectory</c> 恒定以分隔符结尾，
+    /// 于是 <c>--root</c> 很容易拿到带尾反斜杠的路径——拼进命令行就是上面 <see cref="QuoteArg"/>
+    /// 注释里那个「根目录带字面引号」的故障。驱动器根必须保留 <c>C:\</c> 形式，
+    /// 否则 <c>C:</c> 会退化成「当前目录」语义。
+    /// </summary>
+    internal static string NormalizeRoot(string path)
+    {
+        if (string.IsNullOrEmpty(path)) return path;
+        var trimmed = path.TrimEnd('\\', '/');
+        if (trimmed.Length == 0) return path;                       // "\" 或 "/"：盘符相对根，原样留着
+        if (trimmed.Length == 2 && trimmed[1] == ':') return trimmed + Path.DirectorySeparatorChar;
+        return trimmed;
     }
 
     public static string? FindNativeBridge(string root)
@@ -309,7 +338,47 @@ public sealed class BridgeHost : IDisposable
         try { if (!proc.HasExited) proc.Kill(); } catch { }
     }
 
-    private static string QuoteArg(string arg) => "\"" + arg + "\"";
+    /// <summary>
+    /// 把一个实参按 Windows CRT 命令行规则引用（net48 没有 <c>ProcessStartInfo.ArgumentList</c>，
+    /// 只能自己拼 <c>Arguments</c>）。
+    ///
+    /// 之前这里是裸加引号 <c>"\"" + arg + "\""</c>，不做反斜杠倍增：参数以反斜杠结尾时
+    /// （<c>AppContext.BaseDirectory</c> 恒定如此，驱动器根目录更是必然），产出的
+    /// <c>"C:\path\"</c> 里 <c>\"</c> 被解析成**字面引号**，桥收到 <c>C:\path"</c>。
+    /// 后果：Python 桥 <c>os.chdir</c> 抛 WinError 123 直接起不来；C 桥能起但根目录认错，
+    /// 预置 config.json 读不到、get_instances 空、save_settings 返回 true 却写不到 root 下。
+    ///
+    /// 规则（与 CRT / CommandLineToArgvW 一致）：引号内的 <c>"</c> 前面加 <c>\</c>；
+    /// 紧邻收尾引号的那串反斜杠要成对倍增；引号前那一串反斜杠同样倍增。
+    /// </summary>
+    internal static string QuoteArg(string arg)
+    {
+        if (string.IsNullOrEmpty(arg)) return "\"\"";
+        var sb = new StringBuilder(arg.Length + 8);
+        sb.Append('"');
+        var backslashes = 0;
+        foreach (var c in arg)
+        {
+            if (c == '\\')
+            {
+                backslashes++;
+                continue;
+            }
+            if (c == '"')
+            {
+                // 引号前的反斜杠倍增，再给引号自己加一个转义反斜杠
+                sb.Append('\\', backslashes * 2 + 1).Append('"');
+            }
+            else
+            {
+                sb.Append('\\', backslashes).Append(c);
+            }
+            backslashes = 0;
+        }
+        // 结尾的反斜杠紧邻收尾引号，必须倍增，否则最后一个 \" 被当成转义引号
+        sb.Append('\\', backslashes * 2).Append('"');
+        return sb.ToString();
+    }
 
     private static string NewToken()
     {

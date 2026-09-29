@@ -221,12 +221,18 @@ public static class Motion
     /// <summary>
     /// 数字滚动。跟着合成器的渲染节拍走（CompositionTarget.Rendering），不自己开 16ms 的
     /// DispatcherTimer——那种定时器和真实刷新率对不齐，既会多跑帧也会掉帧，页面一多还各跑各的。
+    ///
+    /// <paramref name="done"/> 在滚动**正常跑完**时回调一次（动画被禁用时立刻回调）。
+    /// 滚动中每帧写的都是 <paramref name="fmt"/> 格式化出来的过场数字，拿不到「权威文案」，
+    /// 所以调用方要把后端文案写回时得用这个回调，不能在调用 CountUp 之后直接赋值——
+    /// 那样会被下一帧覆盖（游玩时长页显示的就一直是 total/3600 的滚动值）。
     /// </summary>
-    public static void CountUp(TextBlock tb, double from, double to, string fmt = "0", double ms = 620)
+    public static void CountUp(TextBlock tb, double from, double to, string fmt = "0", double ms = 620, Action? done = null)
     {
         if (!Enabled)
         {
             tb.Text = to.ToString(fmt);
+            done?.Invoke();
             return;
         }
         var sw = System.Diagnostics.Stopwatch.StartNew();
@@ -238,7 +244,12 @@ public static class Motion
             var e = 1 - Math.Pow(1 - t, 3);
             tb.Text = (from + (to - from) * e).ToString(fmt);
             // 文本块被换掉 / 页面已卸载就别再占着渲染回调。
-            if (t >= 1 || !tb.IsLoaded && tb.Parent is null) CompositionTarget.Rendering -= tick;
+            if (t >= 1 || !tb.IsLoaded && tb.Parent is null)
+            {
+                CompositionTarget.Rendering -= tick;
+                // 只有真跑完才回调：卸载中断的那次不该再往已经不在的元素上写字
+                if (t >= 1) done?.Invoke();
+            }
         };
         CompositionTarget.Rendering += tick;
     }
